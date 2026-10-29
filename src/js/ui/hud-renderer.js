@@ -6,6 +6,16 @@ const COL = {
   REJECT: "#ff2d3a"
 };
 
+const PAL = [
+  [255, 45, 58, 70],
+  [56, 182, 255, 26],
+  [61, 255, 106, 70]
+];
+
+let mosaic = null;
+let mctx = null;
+let lastCls = null;
+
 export function coverTransform(canvasCssW, canvasCssH, srcW, srcH) {
   const s = Math.max(canvasCssW / srcW, canvasCssH / srcH);
   const ox = (canvasCssW - srcW * s) / 2;
@@ -77,22 +87,55 @@ function leaderLine(ctx, box, x, y, color) {
   ctx.restore();
 }
 
-function selectTop(tracks) {
-  const good = tracks
-    .filter(t => t.cls === "GRIP" || t.cls === "CHECK")
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 4);
-  const bad = tracks
-    .filter(t => t.cls === "REJECT")
-    .sort((a, b) => (b.conf || 0) - (a.conf || 0))
-    .slice(0, 2);
-  return [...good, ...bad];
+function ensureMosaic(bw, bh) {
+  if (!mosaic) {
+    mosaic = typeof OffscreenCanvas !== "undefined"
+      ? new OffscreenCanvas(bw, bh)
+      : document.createElement("canvas");
+    mctx = mosaic.getContext("2d");
+  }
+  if (mosaic.width !== bw || mosaic.height !== bh) {
+    mosaic.width = bw;
+    mosaic.height = bh;
+    lastCls = null;
+  }
 }
 
-export function drawHUD(ctx, tracks, meta, layers, canvasCssW, canvasCssH, mirror) {
+function drawMosaic(ctx, cls, bw, bh, ct, sx, sy, canvasCssW, canvasCssH, t) {
+  if (!cls || !bw || !bh) return;
+  ensureMosaic(bw, bh);
+
+  // Rebuild ImageData only when cls buffer identity changes (~analysis rate)
+  if (cls !== lastCls) {
+    const img = mctx.createImageData(bw, bh);
+    const d = img.data;
+    for (let i = 0; i < cls.length; i++) {
+      const p = PAL[cls[i]] || PAL[1];
+      const o = i * 4;
+      d[o] = p[0]; d[o + 1] = p[1]; d[o + 2] = p[2]; d[o + 3] = p[3];
+    }
+    mctx.putImageData(img, 0, 0);
+    lastCls = cls;
+  }
+
+  ctx.save();
+  ctx.imageSmoothingEnabled = true;
+  try { ctx.imageSmoothingQuality = "high"; } catch (_) {}
+  ctx.drawImage(mosaic, ct.ox, ct.oy, bw * sx, bh * sy);
+
+  const y = ((t % 2200) / 2200) * canvasCssH;
+  const g = ctx.createLinearGradient(0, y - 40, 0, y);
+  g.addColorStop(0, "rgba(56,182,255,0)");
+  g.addColorStop(1, "rgba(56,182,255,0.35)");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, y - 40, canvasCssW, 40);
+  ctx.restore();
+}
+
+export function drawHUD(ctx, tracks, meta, layers, canvasCssW, canvasCssH, mirror, now = performance.now()) {
   ctx.clearRect(0, 0, canvasCssW, canvasCssH);
 
-  const { bw, bh, vw, vh, w, h } = meta;
+  const { bw, bh, vw, vh, w, h, cls } = meta;
   if (!bw || !bh) return;
 
   const srcW = vw || w || 320;
@@ -102,15 +145,18 @@ export function drawHUD(ctx, tracks, meta, layers, canvasCssW, canvasCssH, mirro
   const sx = (srcW / bw) * ct.s;
   const sy = (srcH / bh) * ct.s;
 
-  const top = selectTop(tracks);
+  if (layers.mosaic !== false && cls) {
+    drawMosaic(ctx, cls, bw, bh, ct, sx, sy, canvasCssW, canvasCssH, now);
+  }
+
+  // Worker already marked show + smoothed contour
+  const top = tracks.filter(t => t.show && (layers.reject !== false || t.cls !== "REJECT"));
   const placed = [];
 
   for (const k of top) {
-    if (k.cls === "REJECT" && layers.reject === false) continue;
     const c = COL[k.cls] || COL.CHECK;
     const age = Math.min(1, k.age / 10);
 
-    // Contour always class-colored (texture), never greyed by slope confidence
     if (layers.contour !== false && k.contour) {
       ctx.save();
       ctx.strokeStyle = c;
@@ -144,20 +190,10 @@ export function drawHUD(ctx, tracks, meta, layers, canvasCssW, canvasCssH, mirro
         ctx.translate(-(box.x + box.w / 2), 0);
       }
       const pct = Math.round((k.conf ?? k.score) * 100);
-      let confLabel;
-      if (k.cls === "REJECT") {
-        confLabel = `SCORE ${pct}`;
-      } else {
-        confLabel = `SCORE ${pct}`;
-        const slopeFmt = formatSlope(k.slopeDeg, k.slopeConf ?? 0, k.depthMode || "est");
-        if (slopeFmt) confLabel += ` ${slopeFmt.text}`;
-      }
-      drawLabelBox(
-        ctx, box,
-        `L${k.id} ${k.tag || "SMOOTH"}`,
-        confLabel,
-        c
-      );
+      let confLabel = `SCORE ${pct}`;
+      const slopeFmt = formatSlope(k.slopeDeg, k.slopeConf ?? 0, k.depthMode || "est");
+      if (slopeFmt) confLabel += ` ${slopeFmt.text}`;
+      drawLabelBox(ctx, box, `L${k.id} ${k.tag || "SMOOTH"}`, confLabel, c);
       ctx.restore();
 
       if (layers.leader !== false) {

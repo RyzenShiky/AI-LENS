@@ -42,7 +42,8 @@ let rvfcHandle = null;
 let lastTracks = [];
 let lastMeta = { w: 320, h: 180, bw: 40, bh: 22, vw: 320, vh: 180 };
 let frameCount = 0, fpsLast = 0;
-let layers = JSON.parse(localStorage.getItem("tv_layers") || '{"contour":true,"labels":true,"leader":true,"reject":true}');
+const LAYER_DEFAULTS = { contour: true, labels: true, leader: true, reject: true, mosaic: true };
+let layers = { ...LAYER_DEFAULTS, ...JSON.parse(localStorage.getItem("tv_layers") || "{}") };
 let wakeLock = null;
 let cssW = 1, cssH = 1;
 let mirrorOverlay = false;
@@ -147,7 +148,9 @@ function initWorker() {
         lastTracks = msg.tracked;
         lastMeta = {
           w: msg.w, h: msg.h, bw: msg.bw, bh: msg.bh,
-          vw: msg.vw, vh: msg.vh
+          vw: msg.vw, vh: msg.vh,
+          cls: msg.cls || null,
+          tHi: msg.tHi, tLo: msg.tLo
         };
         countGrip.textContent = msg.counts.GRIP || 0;
         countCheck.textContent = msg.counts.CHECK || 0;
@@ -163,10 +166,7 @@ function initWorker() {
         }
 
         const grips = msg.counts.GRIP || 0;
-        if ((msg.counts.GRIP || 0) + (msg.counts.CHECK || 0) > 0)
-          setBanner("SURFACE TEXTURE MAP", "PATCH ANALYSIS");
-        else
-          setBanner("ANALYSING TERRAIN", "SCANNING SURFACE");
+        setBanner("SURFACE TEXTURE MAP", "RELATIVE TO SCENE");
 
         frameCount++;
         const now = performance.now();
@@ -236,6 +236,9 @@ async function processFrame() {
         slopeConf = Math.min(slopeConf, d.slopeConf);
       }
     }
+    const landscape = cssW > cssH;
+    const cols = landscape ? 4 : 3;
+    const rows = landscape ? 3 : 4;
     const bitmap = await createImageBitmap(video);
     worker.postMessage({
       type: "frame",
@@ -243,7 +246,9 @@ async function processFrame() {
       slopeDeg,
       slopeConf,
       depthId,
-      depthMode
+      depthMode,
+      cols,
+      rows
     }, [bitmap]);
   } catch (e) {
     sending = false;
@@ -254,7 +259,7 @@ async function processFrame() {
 function renderLoop() {
   canvas.style.transform = mirrorOverlay ? "scaleX(-1)" : "none";
   if (fontsReady) {
-    drawHUD(ctx, lastTracks, lastMeta, layers, cssW, cssH, mirrorOverlay);
+    drawHUD(ctx, lastTracks, lastMeta, layers, cssW, cssH, mirrorOverlay, performance.now());
   }
   requestAnimationFrame(renderLoop);
 }
@@ -368,7 +373,7 @@ layersBtn.addEventListener("click", () => {
 });
 
 layersPop.querySelectorAll("input[type=checkbox]").forEach(inp => {
-  inp.checked = !!layers[inp.name];
+  inp.checked = layers[inp.name] !== false;
   inp.addEventListener("change", () => {
     layers[inp.name] = inp.checked;
     localStorage.setItem("tv_layers", JSON.stringify(layers));

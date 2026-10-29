@@ -1,5 +1,6 @@
 import { Tracker } from "./tracker.js";
 import { scorePatch } from "./scorer.js";
+import { pickSpread } from "./pick-spread.js";
 
 let M = null;
 let tracker = new Tracker();
@@ -12,6 +13,14 @@ let capRGBA = 0;
 const BLOCK = 8;
 const MAX_CONTOUR = 512;
 const PATCH_STRIDE = 48;
+
+/** EMA state for relative thresholds — reduces flicker */
+const emaState = { hi: null, lo: null };
+function ema(key, value, alpha = 0.25) {
+  if (emaState[key] == null) emaState[key] = value;
+  else emaState[key] = alpha * value + (1 - alpha) * emaState[key];
+  return emaState[key];
+}
 
 function simdSupported() {
   try {
@@ -88,7 +97,6 @@ function chaikin(pts, iters) {
   return Array.from(cur);
 }
 
-/** Raw contour (cell centers) — no Chaikin yet */
 function readContourRaw(nPts) {
   if (nPts < 2) return null;
   const view = new Int16Array(M.HEAPU8.buffer, ptrContour, nPts * 2);
@@ -133,19 +141,11 @@ function collectFromMap(mapPtr, thr, forceReject, bw, bh, slopeInfo) {
   });
 }
 
-/** Smooth contours only for tracks that will be shown (top N) */
-function smoothDisplayed(tracked) {
-  const good = tracked.filter(t => t.cls === "GRIP" || t.cls === "CHECK")
-    .sort((a, b) => b.score - a.score).slice(0, 4);
-  const bad = tracked.filter(t => t.cls === "REJECT")
-    .sort((a, b) => (b.conf || 0) - (a.conf || 0)).slice(0, 2);
-  const show = new Set([...good, ...bad]);
+function applyShowAndSmooth(tracked, bw, bh, cols, rows) {
+  const chosen = new Set(pickSpread(tracked, bw, bh, cols, rows));
   for (const t of tracked) {
-    if (show.has(t) && t.contourRaw) {
-      t.contour = chaikin(t.contourRaw, 2);
-    } else {
-      t.contour = null; // HUD skips missing contour
-    }
+    t.show = chosen.has(t);
+    t.contour = t.show && t.contourRaw ? chaikin(t.contourRaw, 2) : null;
     delete t.contourRaw;
   }
   return tracked;
@@ -171,6 +171,8 @@ self.onmessage = async (ev) => {
       M = await createModuleFn();
       off = new OffscreenCanvas(320, 180);
       tracker.reset();
+      emaState.hi = null;
+      emaState.lo = null;
       self.postMessage({ type: "ready", simdLoaded: usedSimd });
     } catch (e) {
       self.postMessage({ type: "error", message: String(e) });
@@ -180,6 +182,8 @@ self.onmessage = async (ev) => {
 
   if (data.type === "reset") {
     tracker.reset();
+    emaState.hi = null;
+    emaState.lo = null;
     return;
   }
 
@@ -214,7 +218,7 @@ self.onmessage = async (ev) => {
 
       const img = g.getImageData(0, 0, w, h);
       ensureBuf(w, h);
-      M.HEAPU8.set(img.data, ptrRGBA);
+M.HEAPU8.set(img.data, ptrRGBA);
 
       const bw = w / BLOCK, bh = h / BLOCK;
       M._feasibility_map(ptrRGBA, w, h, ptrMap);
@@ -224,13 +228,33 @@ self.onmessage = async (ev) => {
       const invView = M.HEAPU8.subarray(ptrMapInv, ptrMapInv + mapBytes);
       for (let i = 0; i < mapBytes; i++) invView[i] = 255 - mapView[i];
 
-      const good = collectFromMap(ptrMap, 150, false, bw, bh, slopeInfo);
-      const bad  = collectFromMap(ptrMapInv, 160, true, bw, bh, slopeInfo);
-      const cellLimit = bw * bh * 0.4;
+      // Relative thresholds (percentiles) + EMA anti-flicker
+      // Floor: optional absolute minimum so pure noise doesn't invent "smooth"
+      const ABS_FLOOR = 40;
+      const sorted = Uint8Array.from(mapView);
+      sorted.sort();
+      const rawHi = sorted[(sorted.length * 0.67) | 0];
+      const rawLo = sorted[(sorted.length * 0.33) | 0];
+      const tHi = Math.max(ABS_FLOOR, ema("hi", rawHi) | 0);
+      const tLo = Math.min(tHi - 1, ema("lo", rawLo) | 0);
+
+      // Per-cell class map: 0=rough, 1=mixed, 2=smooth (relative to this scene)
+      const cls = new Uint8Array(mapBytes);
+      for (let i = 0; i < mapBytes; i++) {
+        const v = mapView[i];
+        cls[i] = v >= tHi ? 2 : v <= tLo ? 0 : 1;
+      }
+
+      const good = collectFromMap(ptrMap, tHi, false, bw, bh, slopeInfo);
+      const bad  = collectFromMap(ptrMapInv, 255 - tLo, true, bw, bh, slopeInfo);
+      // Soft cap: allow larger rough patches (was 40%)
+      const cellLimit = bw * bh * 0.55;
       const badFiltered = bad.filter(p => p.area <= cellLimit);
 
+      const cols = data.cols || 3;
+      const rows = data.rows || 4;
       let tracked = tracker.update([...good, ...badFiltered]);
-      tracked = smoothDisplayed(tracked);
+      tracked = applyShowAndSmooth(tracked, bw, bh, cols, rows);
       const ms = performance.now() - t0;
 
       const counts = { GRIP: 0, CHECK: 0, REJECT: 0 };
@@ -245,8 +269,10 @@ self.onmessage = async (ev) => {
         depthId: slopeInfo.depthId,
         depthMode: slopeInfo.depthMode,
         slopeDeg: slopeInfo.slopeDeg,
-        slopeConf: slopeInfo.slopeConf
-      });
+        slopeConf: slopeInfo.slopeConf,
+        tHi, tLo,
+        cls
+      }, [cls.buffer]);
     } catch (e) {
       self.postMessage({ type: "error", message: String(e) });
     } finally {

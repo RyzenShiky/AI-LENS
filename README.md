@@ -6,6 +6,8 @@ Classical **surface texture** mapping demo. Optional slope only when real depth 
 
 Patches come from edge-density + texture variance (smooth vs rough), **not** from measured terrain angle.
 
+Thresholds are **relative per frame** (≈ top/bottom third of feasibility values, EMA-smoothed). About one third of cells will always be labeled “smoothest” even if the whole scene is rough — HUD shows **RELATIVE TO SCENE**. Optional absolute floor avoids pure noise becoming “smooth”.
+
 | Internal class | User label | Meaning |
 |----------------|------------|---------|
 | GRIP | SMOOTH | Low edge density / smoother texture |
