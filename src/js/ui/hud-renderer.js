@@ -6,16 +6,6 @@ const COL = {
   REJECT: "#ff2d3a"
 };
 
-const PAL = [
-  [255, 45, 58, 70],
-  [56, 182, 255, 26],
-  [61, 255, 106, 70]
-];
-
-let mosaic = null;
-let mctx = null;
-let lastCls = null;
-
 export function coverTransform(canvasCssW, canvasCssH, srcW, srcH) {
   const s = Math.max(canvasCssW / srcW, canvasCssH / srcH);
   const ox = (canvasCssW - srcW * s) / 2;
@@ -23,18 +13,20 @@ export function coverTransform(canvasCssW, canvasCssH, srcW, srcH) {
   return { s, ox, oy, srcW, srcH };
 }
 
-function pathPartial(ctx, contour, age, cellToPx) {
-  if (!contour || contour.length < 4) return;
-  const n = Math.max(2, Math.floor((contour.length / 2) * age));
+function smoothPath(ctx, contour, cellToPx) {
+  if (!contour || contour.length < 6) return;
   const { ox, oy, s, srcW, srcH, bw, bh } = cellToPx;
   const sx = (srcW / bw) * s;
   const sy = (srcH / bh) * s;
+  const px = (i) => ox + contour[i] * sx;
+  const py = (i) => oy + contour[i + 1] * sy;
+  const n = contour.length;
   ctx.beginPath();
-  ctx.moveTo(ox + contour[0] * sx, oy + contour[1] * sy);
-  for (let i = 1; i < n; i++) {
-    ctx.lineTo(ox + contour[i * 2] * sx, oy + contour[i * 2 + 1] * sy);
+  ctx.moveTo((px(0) + px(2)) / 2, (py(0) + py(2)) / 2);
+  for (let i = 2; i < n - 2; i += 2) {
+    ctx.quadraticCurveTo(px(i), py(i), (px(i) + px(i + 2)) / 2, (py(i) + py(i + 2)) / 2);
   }
-  if (age >= 0.99) ctx.closePath();
+  ctx.closePath();
 }
 
 function roundRectPath(ctx, x, y, w, h, r) {
@@ -50,15 +42,12 @@ function roundRectPath(ctx, x, y, w, h, r) {
 
 function drawLabelBox(ctx, box, line1, line2, color) {
   ctx.save();
-  ctx.shadowColor = color;
-  ctx.shadowBlur = 8;
   ctx.fillStyle = "rgba(8,16,24,0.82)";
   ctx.strokeStyle = color;
   ctx.lineWidth = 1.5;
   roundRectPath(ctx, box.x, box.y, box.w, box.h, 4);
   ctx.fill();
   ctx.stroke();
-  ctx.shadowBlur = 0;
   ctx.fillStyle = color;
   ctx.font = "700 11px 'Share Tech Mono', monospace";
   ctx.fillText(line1, box.x + 6, box.y + 13);
@@ -87,55 +76,11 @@ function leaderLine(ctx, box, x, y, color) {
   ctx.restore();
 }
 
-function ensureMosaic(bw, bh) {
-  if (!mosaic) {
-    mosaic = typeof OffscreenCanvas !== "undefined"
-      ? new OffscreenCanvas(bw, bh)
-      : document.createElement("canvas");
-    mctx = mosaic.getContext("2d");
-  }
-  if (mosaic.width !== bw || mosaic.height !== bh) {
-    mosaic.width = bw;
-    mosaic.height = bh;
-    lastCls = null;
-  }
-}
-
-function drawMosaic(ctx, cls, bw, bh, ct, sx, sy, canvasCssW, canvasCssH, t) {
-  if (!cls || !bw || !bh) return;
-  ensureMosaic(bw, bh);
-
-  // Rebuild ImageData only when cls buffer identity changes (~analysis rate)
-  if (cls !== lastCls) {
-    const img = mctx.createImageData(bw, bh);
-    const d = img.data;
-    for (let i = 0; i < cls.length; i++) {
-      const p = PAL[cls[i]] || PAL[1];
-      const o = i * 4;
-      d[o] = p[0]; d[o + 1] = p[1]; d[o + 2] = p[2]; d[o + 3] = p[3];
-    }
-    mctx.putImageData(img, 0, 0);
-    lastCls = cls;
-  }
-
-  ctx.save();
-  ctx.imageSmoothingEnabled = true;
-  try { ctx.imageSmoothingQuality = "high"; } catch (_) {}
-  ctx.drawImage(mosaic, ct.ox, ct.oy, bw * sx, bh * sy);
-
-  const y = ((t % 2200) / 2200) * canvasCssH;
-  const g = ctx.createLinearGradient(0, y - 40, 0, y);
-  g.addColorStop(0, "rgba(56,182,255,0)");
-  g.addColorStop(1, "rgba(56,182,255,0.35)");
-  ctx.fillStyle = g;
-  ctx.fillRect(0, y - 40, canvasCssW, 40);
-  ctx.restore();
-}
-
-export function drawHUD(ctx, tracks, meta, layers, canvasCssW, canvasCssH, mirror, now = performance.now()) {
+/** Overlay only — mosaic is a separate DOM canvas */
+export function drawHUD(ctx, tracks, meta, layers, canvasCssW, canvasCssH, mirror) {
   ctx.clearRect(0, 0, canvasCssW, canvasCssH);
 
-  const { bw, bh, vw, vh, w, h, cls } = meta;
+  const { bw, bh, vw, vh, w, h } = meta;
   if (!bw || !bh) return;
 
   const srcW = vw || w || 320;
@@ -145,28 +90,25 @@ export function drawHUD(ctx, tracks, meta, layers, canvasCssW, canvasCssH, mirro
   const sx = (srcW / bw) * ct.s;
   const sy = (srcH / bh) * ct.s;
 
-  if (layers.mosaic !== false && cls) {
-    drawMosaic(ctx, cls, bw, bh, ct, sx, sy, canvasCssW, canvasCssH, now);
-  }
-
-  // Worker already marked show + smoothed contour
-  const top = tracks.filter(t => t.show && (layers.reject !== false || t.cls !== "REJECT"));
+  // Worker already sent only chosen tracks
+  const top = tracks.filter(t => layers.reject !== false || t.cls !== "REJECT");
   const placed = [];
 
   for (const k of top) {
     const c = COL[k.cls] || COL.CHECK;
-    const age = Math.min(1, k.age / 10);
 
-    if (layers.contour !== false && k.contour) {
+    if (layers.contour !== false && k.contour && k.contour.length >= 6) {
       ctx.save();
+      smoothPath(ctx, k.contour, cellToPx);
       ctx.strokeStyle = c;
-      ctx.lineWidth = 2;
-      ctx.shadowColor = c;
-      ctx.shadowBlur = 6;
-      ctx.fillStyle = c + "28";
-      pathPartial(ctx, k.contour, age, cellToPx);
-      ctx.fill();
+      ctx.lineWidth = 5;
+      ctx.globalAlpha = 0.25;
       ctx.stroke();
+      ctx.lineWidth = 2;
+      ctx.globalAlpha = 1;
+      ctx.stroke();
+      ctx.fillStyle = c + "28";
+      ctx.fill();
       ctx.restore();
     }
 

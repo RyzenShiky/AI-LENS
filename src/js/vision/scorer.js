@@ -4,11 +4,11 @@ const AREA_REF = 40;
 /**
  * Texture-based score. EST slope never affects class.
  * Slope term only when depthMode is fused/ai with real confidence.
+ * Bobot tanpa slope: flatness 0.6875, size 0.3125 (setara perilaku sebelumnya).
  */
 export function scorePatch(p) {
   const flat = p.flatness ?? 0.5;
   const sizeTerm = Math.min(1, (p.area || 0) / AREA_REF);
-  const roughness = p.roughness ?? (1 - flat);
 
   const mode = p.depthMode || "est";
   let slopeConf = Math.max(0, Math.min(1, p.slopeConf ?? 0));
@@ -20,15 +20,10 @@ export function scorePatch(p) {
   }
   const wSlope = 0.20 * slopeConf;
   const rest = 1 - wSlope;
-  const wFlat = rest * (0.40 / 0.80);
-  const wSize = rest * (0.25 / 0.80);
-  const wRough = rest * (0.15 / 0.80);
+  const wFlat = rest * 0.6875;
+  const wSize = rest * 0.3125;
 
-  const s =
-    wFlat * flat +
-    wSize * sizeTerm +
-    wSlope * (1 - slopeNorm) +
-    wRough * (1 - roughness);
+  const s = wFlat * flat + wSize * sizeTerm + wSlope * (1 - slopeNorm);
 
   return {
     score: Math.max(0, Math.min(1, s)),

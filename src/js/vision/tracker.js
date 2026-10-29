@@ -12,10 +12,6 @@ function iou(a, b) {
   return inter / (areaA + areaB - inter + 1e-6);
 }
 
-function centroidDist(a, b) {
-  return Math.hypot(a.cx - b.cx, a.cy - b.cy);
-}
-
 export class Tracker {
   constructor() {
     this.tracks = [];
@@ -30,10 +26,11 @@ export class Tracker {
     for (let ti = 0; ti < this.tracks.length; ti++) {
       for (let di = 0; di < dets.length; di++) {
         const t = this.tracks[ti], d = dets[di];
-        // Do not match GRIP/CHECK tracks to REJECT seeds (and vice versa)
         if (!!t.forceReject !== !!d.forceReject) continue;
+        const dx = t.cx - d.cx, dy = t.cy - d.cy;
+        if (dx * dx + dy * dy > 64) continue;
         const ov = iou(t, d);
-        const dist = centroidDist(t, d);
+        const dist = Math.hypot(dx, dy);
         const score = ov * 2 - dist * 0.05;
         if (ov > 0.1 || dist < 6) pairs.push({ ti, di, score });
       }
@@ -53,13 +50,12 @@ export class Tracker {
       t.minx = d.minx; t.miny = d.miny; t.maxx = d.maxx; t.maxy = d.maxy;
       t.area = d.area;
       t.flatness = d.flatness;
-      t.contour = d.contour || t.contour;
+      t.curId = d.id; // patch id valid only this frame (for delayed trace)
       t.forceReject = !!d.forceReject;
       t.hits++;
       t.miss = 0;
       t.age++;
       t.cls = classify(t.score, t.cls, t.forceReject);
-      // For REJECT show risk (1 - flatness); else EMA of score
       if (t.forceReject || t.cls === "REJECT") {
         t.conf = a * (1 - (t.flatness ?? 0)) + (1 - a) * (t.conf ?? (1 - (t.flatness ?? 0)));
       } else {
@@ -74,12 +70,11 @@ export class Tracker {
       const d = dets[di];
       const forceReject = !!d.forceReject;
       const cls = classify(d.score, null, forceReject);
-      const conf = forceReject || cls === "REJECT"
-        ? (1 - (d.flatness ?? 0))
-        : d.score;
+      const conf = forceReject || cls === "REJECT" ? (1 - (d.flatness ?? 0)) : d.score;
       this.tracks.push({
         ...d,
         id: this.nextId++,
+        curId: d.id,
         forceReject,
         cls,
         conf,
@@ -97,8 +92,8 @@ export class Tracker {
       this.tracks[ti].age++;
     }
 
-    this.tracks = this.tracks.filter(t => t.miss <= 8);
-    return this.tracks.filter(t => t.hits >= 3);
+    this.tracks = this.tracks.filter(t => t.miss <= 3);
+    return this.tracks.filter(t => t.hits >= 3 && t.miss === 0);
   }
 
   reset() {

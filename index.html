@@ -15,7 +15,9 @@
   <main class="app">
     <div class="stage">
       <video id="camera" autoplay muted playsinline></video>
-      <canvas id="overlay"></canvas>
+      <canvas id="mosaic"></canvas>
+    <div class="sweep" aria-hidden="true"></div>
+    <canvas id="overlay"></canvas>
       <div class="scanline" aria-hidden="true"></div>
     </div>
 
@@ -24,6 +26,7 @@
       <div class="chips">
         <span class="chip" id="fps">0 FPS</span>
         <span class="chip chip-dim" id="depthChip">DEPTH:EST</span>
+        <span class="chip chip-dim" id="modeChip">BAL · 12Hz</span>
       </div>
     </header>
 
@@ -53,6 +56,12 @@
         <div class="metric"><span>ROUGH</span><strong id="countReject">0</strong></div>
         <div class="metric"><span>LATENCY</span><strong id="latency">—</strong></div>
         <div class="metric"><span>ENGINE</span><strong id="engineStat">OFFLINE</strong></div>
+      </div>
+      <div class="seg" id="modeSeg" role="radiogroup" aria-label="Mode">
+        <button type="button" data-mode="auto" aria-pressed="true">AUTO</button>
+        <button type="button" data-mode="performance">PERF</button>
+        <button type="button" data-mode="balanced">BAL</button>
+        <button type="button" data-mode="quality">QUAL</button>
       </div>
       <p class="disclaimer">Visual estimate only · not for navigation or safety decisions · angles approximate when shown</p>
     </section>

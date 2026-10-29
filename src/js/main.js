@@ -1,18 +1,22 @@
 import { CameraManager } from "./camera/camera-manager.js";
-import { drawHUD } from "./ui/hud-renderer.js";
+import { drawHUD, coverTransform } from "./ui/hud-renderer.js";
 import {
   OrientationHelper,
   pickDepthProvider,
   GroundPlaneEstimate
 } from "./depth/depth-provider.js";
 import { depthBadge, slopeConfidence, formatSlope } from "./depth/fusion.js";
+import { MODES, ORDER, AutoMode } from "./ui/modes.js";
 
 const video  = document.querySelector("#camera");
 const canvas = document.querySelector("#overlay");
+const mosaicEl = document.querySelector("#mosaic");
 const ctx    = canvas.getContext("2d");
+const mctx   = mosaicEl?.getContext("2d");
 
 const camera = new CameraManager(video);
 const orient = new OrientationHelper();
+const autoMode = new AutoMode();
 
 const startBtn  = document.querySelector("#startButton");
 const flipBtn   = document.querySelector("#flipButton");
@@ -32,7 +36,9 @@ const countReject = document.querySelector("#countReject");
 const latencyEl = document.querySelector("#latency");
 const engineEl  = document.querySelector("#engineStat");
 const depthChip = document.querySelector("#depthChip");
+const modeChip  = document.querySelector("#modeChip");
 const layersPop = document.querySelector("#layersPop");
+const modeSeg   = document.querySelector("#modeSeg");
 
 let worker = null;
 let workerReady = false;
@@ -41,19 +47,53 @@ let sending = false;
 let rvfcHandle = null;
 let lastTracks = [];
 let lastMeta = { w: 320, h: 180, bw: 40, bh: 22, vw: 320, vh: 180 };
-let frameCount = 0, fpsLast = 0;
+let frameCount = 0, fpsLast = 0, achievedHz = 0;
+
+const store = {
+  get(key, fallback = null) {
+    try {
+      const v = localStorage.getItem(key);
+      return v === null ? fallback : v;
+    } catch (_) { return fallback; }
+  },
+  set(key, value) {
+    try { localStorage.setItem(key, value); } catch (_) {}
+  },
+  getJSON(key, fallback = {}) {
+    try {
+      const raw = localStorage.getItem(key);
+      if (!raw) return fallback;
+      const v = JSON.parse(raw);
+      return v && typeof v === "object" && !Array.isArray(v) ? v : fallback;
+    } catch (_) { return fallback; }
+  }
+};
+
 const LAYER_DEFAULTS = { contour: true, labels: true, leader: true, reject: true, mosaic: true };
-let layers = { ...LAYER_DEFAULTS, ...JSON.parse(localStorage.getItem("tv_layers") || "{}") };
+let layers = { ...LAYER_DEFAULTS, ...store.getJSON("tv_layers") };
 let wakeLock = null;
 let cssW = 1, cssH = 1;
 let mirrorOverlay = false;
 let depthProvider = null;
 let fontsReady = false;
+let dirty = true;
+let lastSent = 0;
+let renderMs = 0;
+let mImg = null;
+
+let modePref = store.get("tv_mode", "auto"); // auto | performance | balanced | quality
+if (modePref !== "auto" && !MODES[modePref]) modePref = "auto";
+let currentMode = "balanced";
+autoMode.reset();
+if (modePref !== "auto" && MODES[modePref]) currentMode = modePref;
+else currentMode = ORDER[autoMode.i];
+
+const PAL = [[255,45,58,70],[56,182,255,26],[61,255,106,70]];
 
 const ONBOARD = {
   idle: {
     title: "TerrainVision",
-    text: "Real-time foothold cues from classical vision. This is a research demo, not a climbing or safety tool."
+    text: "Real-time surface texture map from classical vision. Research demo — not a safety tool."
   },
   denied: {
     title: "Camera permission denied",
@@ -90,11 +130,37 @@ function setBanner(main, sub) {
   bannerSub.textContent = sub;
 }
 
+function updateModeChip() {
+  if (!modeChip) return;
+  const cfg = MODES[currentMode];
+  const tag = modePref === "auto" ? `AUTO · ${currentMode.slice(0, 3).toUpperCase()}` : currentMode.slice(0, 4).toUpperCase();
+  modeChip.textContent = `${tag} · ${cfg.hz}Hz`;
+}
+
+function applyMode(name) {
+  if (!MODES[name]) return;
+  currentMode = name;
+  updateModeChip();
+  resizeCanvas();
+  layoutMosaic(lastMeta.vw || 320, lastMeta.vh || 180);
+  worker?.postMessage({ type: "reset" });
+  dirty = true;
+}
+
+function effectiveLayers() {
+  return {
+    ...layers,
+    contour: layers.contour !== false && MODES[currentMode].contour
+  };
+}
+
 function resizeCanvas() {
   const r = canvas.getBoundingClientRect();
   cssW = Math.max(1, r.width);
   cssH = Math.max(1, r.height);
-  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const cfg = MODES[currentMode];
+  const dpr = Math.min(cfg.dpr, window.devicePixelRatio || 1);
+  dirty = true;
   const bw = Math.round(cssW * dpr);
   const bh = Math.round(cssH * dpr);
   if (canvas.width !== bw || canvas.height !== bh) {
@@ -102,6 +168,37 @@ function resizeCanvas() {
     canvas.height = bh;
   }
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  layoutMosaic(lastMeta.vw || 320, lastMeta.vh || 180);
+}
+
+function updateMosaic(cls, bw, bh) {
+  if (!mosaicEl || !mctx || !cls) return;
+  if (mosaicEl.width !== bw || mosaicEl.height !== bh) {
+    mosaicEl.width = bw;
+    mosaicEl.height = bh;
+    mImg = mctx.createImageData(bw, bh);
+  }
+  if (!mImg) mImg = mctx.createImageData(bw, bh);
+  const d = mImg.data;
+  for (let i = 0; i < cls.length; i++) {
+    const p = PAL[cls[i]] || PAL[1];
+    const o = i * 4;
+    d[o] = p[0]; d[o + 1] = p[1]; d[o + 2] = p[2]; d[o + 3] = p[3];
+  }
+  mctx.putImageData(mImg, 0, 0);
+}
+
+function layoutMosaic(vw, vh) {
+  if (!mosaicEl) return;
+  const ct = coverTransform(cssW, cssH, vw, vh);
+  Object.assign(mosaicEl.style, {
+    left: ct.ox + "px",
+    top: ct.oy + "px",
+    width: vw * ct.s + "px",
+    height: vh * ct.s + "px",
+    transform: mirrorOverlay ? "scaleX(-1)" : "none"
+  });
+  mosaicEl.hidden = layers.mosaic === false;
 }
 
 const ro = new ResizeObserver(() => resizeCanvas());
@@ -164,16 +261,27 @@ function initWorker() {
           depthChip.textContent = fmt ? `${badge} ${fmt.text}` : badge;
           depthChip.dataset.tier = fmt?.tier || "low";
         }
-
-        const grips = msg.counts.GRIP || 0;
         setBanner("SURFACE TEXTURE MAP", "RELATIVE TO SCENE");
+        dirty = true;
+        if (msg.cls && msg.bw && msg.bh) updateMosaic(msg.cls, msg.bw, msg.bh);
+        layoutMosaic(msg.vw || 320, msg.vh || 180);
 
         frameCount++;
         const now = performance.now();
         if (now - fpsLast >= 1000) {
+          achievedHz = frameCount;
           fpsChip.textContent = `${frameCount} FPS`;
           frameCount = 0;
           fpsLast = now;
+        }
+
+        if (modePref === "auto") {
+          const next = autoMode.update({
+            workerMs: msg.ms,
+            renderMs,
+            achievedHz
+          });
+          if (next !== currentMode) applyMode(next);
         }
       }
     };
@@ -199,16 +307,20 @@ function cancelRvfc() {
 
 function scheduleFrame() {
   if (!running) return;
+  const tick = async () => {
+    if (!running) return;
+    const now = performance.now();
+    const hz = MODES[currentMode].hz;
+    if (now - lastSent >= 1000 / hz) {
+      lastSent = now;
+      await processFrame();
+    }
+    scheduleFrame();
+  };
   if (video.requestVideoFrameCallback) {
-    rvfcHandle = video.requestVideoFrameCallback(async () => {
-      await processFrame();
-      scheduleFrame();
-    });
+    rvfcHandle = video.requestVideoFrameCallback(tick);
   } else {
-    requestAnimationFrame(async () => {
-      await processFrame();
-      if (running) scheduleFrame();
-    });
+    requestAnimationFrame(tick);
   }
 }
 
@@ -221,13 +333,12 @@ async function processFrame() {
     let slopeDeg = null, slopeConf = 0, depthId = "EST", depthMode = "est";
     if (depthProvider) {
       const d = await depthProvider.depth();
-      slopeDeg = d.slopeDeg; // null in EST
+      slopeDeg = d.slopeDeg;
       depthId = depthProvider.id;
       depthMode = depthId === "XR" ? "fused" : depthId === "AI" ? "ai" : "est";
-      // Only real factors — null → pessimistic inside slopeConfidence
       slopeConf = slopeConfidence({
         mode: depthMode,
-        inlier: d.inlierRatio,           // undefined unless fused
+        inlier: d.inlierRatio,
         gyroMag: d.gyroMag ?? orient.gyroMag ?? null,
         points: d.points ?? null,
         normalStd: d.normalStd ?? null
@@ -239,7 +350,22 @@ async function processFrame() {
     const landscape = cssW > cssH;
     const cols = landscape ? 4 : 3;
     const rows = landscape ? 3 : 4;
-    const bitmap = await createImageBitmap(video);
+    const longSide = MODES[currentMode].longSide;
+    const vh = video.videoHeight || 180;
+    const vw = video.videoWidth || 320;
+    const s = longSide / Math.max(vw, vh);
+    const targetW = Math.max(16, Math.round(vw * s));
+    const targetH = Math.max(16, Math.round(vh * s));
+    let bitmap;
+    try {
+      bitmap = await createImageBitmap(video, {
+        resizeWidth: targetW,
+        resizeHeight: targetH,
+        resizeQuality: "low"
+      });
+    } catch (_) {
+      bitmap = await createImageBitmap(video);
+    }
     worker.postMessage({
       type: "frame",
       bitmap,
@@ -248,7 +374,8 @@ async function processFrame() {
       depthId,
       depthMode,
       cols,
-      rows
+      rows,
+      longSide
     }, [bitmap]);
   } catch (e) {
     sending = false;
@@ -258,11 +385,23 @@ async function processFrame() {
 
 function renderLoop() {
   canvas.style.transform = mirrorOverlay ? "scaleX(-1)" : "none";
-  if (fontsReady) {
-    drawHUD(ctx, lastTracks, lastMeta, layers, cssW, cssH, mirrorOverlay, performance.now());
+  if (mosaicEl) mosaicEl.style.transform = mirrorOverlay ? "scaleX(-1)" : "none";
+  if (dirty && fontsReady) {
+    const t0 = performance.now();
+    drawHUD(ctx, lastTracks, lastMeta, effectiveLayers(), cssW, cssH, mirrorOverlay);
+    renderMs = 0.9 * renderMs + 0.1 * (performance.now() - t0);
+    dirty = false;
   }
   requestAnimationFrame(renderLoop);
 }
+
+try {
+  new PerformanceObserver(list => {
+    for (const e of list.getEntries()) {
+      if (e.duration > 50) console.warn("[longtask]", e.duration | 0, "ms");
+    }
+  }).observe({ entryTypes: ["longtask"] });
+} catch (_) {}
 
 async function acquireWakeLock() {
   try {
@@ -281,14 +420,11 @@ async function start() {
   setState("loading");
   startBtn.dataset.running = "false";
   try {
-    // iOS: request sensor permission first, still inside user gesture
+    // iOS: izin sensor harus diminta langsung dari gesture pengguna
     const orientPerm = orient.start();
     await ensureFonts();
     const orientOk = await orientPerm;
-    if (!orientOk) {
-      // soft notice — analysis still runs without IMU
-      console.warn("Motion/orientation permission denied");
-    }
+    if (!orientOk) console.warn("Motion/orientation permission denied");
     depthProvider = await pickDepthProvider(orient);
     if (!depthProvider) depthProvider = new GroundPlaneEstimate(orient);
 
@@ -301,16 +437,17 @@ async function start() {
     frameCount = 0;
     startBtn.dataset.running = "true";
     setState("running");
-    setBanner("ANALYSING TERRAIN", "SCANNING SURFACE");
+    setBanner("SURFACE TEXTURE MAP", "RELATIVE TO SCENE");
     if (depthChip) depthChip.textContent = `DEPTH:${depthProvider.id}`;
+    updateModeChip();
     worker.postMessage({ type: "reset" });
     cancelRvfc();
     scheduleFrame();
     await acquireWakeLock();
   } catch (e) {
     console.error(e);
-    const msg = String(e);
-    if (msg.includes("NotAllowed") || msg.includes("Permission") || msg.includes("denied")) {
+    const name = e?.name || "";
+    if (name === "NotAllowedError" || name === "SecurityError" || /Permission|denied/i.test(String(e))) {
       setState("denied");
     } else {
       setState("lost");
@@ -353,6 +490,7 @@ flipBtn.addEventListener("click", async () => {
   try {
     const res = await camera.flip();
     mirrorOverlay = res.facingMode === "user";
+    layoutMosaic(lastMeta.vw || 320, lastMeta.vh || 180);
     worker?.postMessage({ type: "reset" });
   } catch (e) {
     console.error(e);
@@ -364,19 +502,38 @@ flipBtn.addEventListener("click", async () => {
 allowBtn?.addEventListener("click", () => start());
 retryBtn?.addEventListener("click", () => start());
 
-sheet.querySelector(".grab").addEventListener("click", () => {
+sheet.querySelector(".grab")?.addEventListener("click", () => {
   sheet.dataset.open = sheet.dataset.open === "true" ? "false" : "true";
 });
 
-layersBtn.addEventListener("click", () => {
+layersBtn?.addEventListener("click", () => {
   layersPop.hidden = !layersPop.hidden;
 });
 
-layersPop.querySelectorAll("input[type=checkbox]").forEach(inp => {
+layersPop?.querySelectorAll("input[type=checkbox]").forEach(inp => {
   inp.checked = layers[inp.name] !== false;
   inp.addEventListener("change", () => {
     layers[inp.name] = inp.checked;
-    localStorage.setItem("tv_layers", JSON.stringify(layers));
+    store.set("tv_layers", JSON.stringify(layers));
+    if (inp.name === "mosaic") layoutMosaic(lastMeta.vw || 320, lastMeta.vh || 180);
+    dirty = true;
+  });
+});
+
+modeSeg?.querySelectorAll("button[data-mode]").forEach(btn => {
+  btn.setAttribute("aria-pressed", btn.dataset.mode === modePref ? "true" : "false");
+  btn.addEventListener("click", () => {
+    modePref = btn.dataset.mode;
+    store.set("tv_mode", modePref);
+    modeSeg.querySelectorAll("button[data-mode]").forEach(b => {
+      b.setAttribute("aria-pressed", b.dataset.mode === modePref ? "true" : "false");
+    });
+    if (modePref === "auto") {
+      autoMode.reset();
+      applyMode(ORDER[autoMode.i]);
+    } else {
+      applyMode(modePref);
+    }
   });
 });
 
@@ -392,6 +549,7 @@ window.addEventListener("pagehide", (e) => {
 
 setState("idle");
 setBanner("TERRAINVISION", "TAP TO START");
+updateModeChip();
 resizeCanvas();
-ensureFonts().then(() => { fontsReady = true; });
+ensureFonts().then(() => { fontsReady = true; dirty = true; });
 renderLoop();
