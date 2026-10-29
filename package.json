@@ -1,0 +1,13 @@
+{
+  "name": "terrainvision",
+  "version": "0.4.2",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:wasm": "em++ src/wasm/terrain.cpp -O3 -std=c++17 -I src/wasm -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=web,worker -sALLOW_MEMORY_GROWTH=1 -sFILESYSTEM=0 -sEXPORTED_FUNCTIONS='[\"_feasibility_map\",\"_label_patches\",\"_extract_patches\",\"_trace_contour\",\"_malloc\",\"_free\"]' -sEXPORTED_RUNTIME_METHODS='[\"HEAPU8\"]' -o build/terrain.mjs",
+    "build:wasm:simd": "em++ src/wasm/terrain.cpp -O3 -msimd128 -std=c++17 -I src/wasm -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=web,worker -sALLOW_MEMORY_GROWTH=1 -sFILESYSTEM=0 -sEXPORTED_FUNCTIONS='[\"_feasibility_map\",\"_label_patches\",\"_extract_patches\",\"_trace_contour\",\"_malloc\",\"_free\"]' -sEXPORTED_RUNTIME_METHODS='[\"HEAPU8\"]' -o build/terrain.simd.mjs",
+    "build:wasm:all": "npm run build:wasm && npm run build:wasm:simd",
+    "serve": "python3 -m http.server 8080",
+    "start": "npm run serve"
+  }
+}
